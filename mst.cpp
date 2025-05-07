@@ -4,32 +4,43 @@
 #include <algorithm>
 #include <mpi.h>
 #include <cassert>
+#include <cstdlib>  
+#include <utility>  
 
 using namespace std;
 
 int rank_, size_, lgsize;
 uint32_t TotVertices;
 
+static int local_n;
+static vertex_id_t*    local2global    = nullptr;
+static edge_id_t*      localEdgeIdArr  = nullptr;
+
 struct Edge {
     vertex_id_t startV;
     vertex_id_t endV;
-    weight_t weight;
-    edge_id_t edge_id;
+    weight_t    weight;
+    edge_id_t   edge_id;
 };
 
 MPI_Datatype MPI_Edge;
 
 void create_mpi_edge_type() {
     Edge dummy = {};
-    int block_lengths[4] = {1, 1, 1, 1};
-    MPI_Aint displacements[4];
-    MPI_Datatype types[4] = {MPI_UNSIGNED, MPI_UNSIGNED, MPI_FLOAT, MPI_UNSIGNED};
+    int          block_lengths[4] = {1, 1, 1, 1};
+    MPI_Aint     displacements[4];
+    MPI_Datatype types[4] = {
+        MPI_UINT32_T,  
+        MPI_UINT32_T,   
+        MPI_DOUBLE,     
+        MPI_UINT64_T    
+    };
 
     MPI_Aint base_address;
     MPI_Get_address(&dummy, &base_address);
-    MPI_Get_address(&dummy.startV, &displacements[0]);
-    MPI_Get_address(&dummy.endV, &displacements[1]);
-    MPI_Get_address(&dummy.weight, &displacements[2]);
+    MPI_Get_address(&dummy.startV,  &displacements[0]);
+    MPI_Get_address(&dummy.endV,    &displacements[1]);
+    MPI_Get_address(&dummy.weight,  &displacements[2]);
     MPI_Get_address(&dummy.edge_id, &displacements[3]);
 
     for (int i = 0; i < 4; i++) {
@@ -40,206 +51,267 @@ void create_mpi_edge_type() {
     MPI_Type_commit(&MPI_Edge);
 }
 
+static void partition_graph(graph_t* G) {
+    vector<int>      rowsCount(size_), rowsDisp(size_);
+    vector<int>      edgesCount(size_), edgesDisp(size_);
+    vector<edge_id_t> globalRows;
+    vector<vertex_id_t> globalEndV;
+    vector<weight_t>    globalWeights;
+    vector<edge_id_t>   globalEdgeIds;
 
-extern "C" void init_mst(graph_t *G)
-{
-    int flag = 0;
-    MPI_Initialized(&flag);
-    if(!flag) {
-        MPI_Init(NULL, NULL);
+    if (rank_ == 0) {
+        globalRows.assign(G->rowsIndices, G->rowsIndices + TotVertices + 1);
+        globalEndV.assign(G->endV,       G->endV + G->rowsIndices[TotVertices]);
+        globalWeights.assign(G->weights, G->weights  + G->rowsIndices[TotVertices]);
+        globalEdgeIds.resize(G->rowsIndices[TotVertices]);
+        for (edge_id_t j = 0; j < globalEdgeIds.size(); j++)
+            globalEdgeIds[j] = j;
+
+        for (int p = 0; p < size_; ++p) {
+            uint32_t start = (TotVertices * p) / size_;
+            uint32_t end   = (TotVertices * (p + 1)) / size_;
+            rowsCount[p]  = static_cast<int>(end - start + 1);
+            rowsDisp[p]   = static_cast<int>(start);
+            edgesCount[p] = static_cast<int>(globalRows[end] - globalRows[start]);
+            edgesDisp[p]  = static_cast<int>(globalRows[start]);
+        }
     }
 
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
-    MPI_Comm_size(MPI_COMM_WORLD, &size_);
-    create_mpi_edge_type();
+    int localRowsCount = 0, localEdgesCount = 0;
+    MPI_Scatter(rowsCount.data(),  1, MPI_INT,
+                &localRowsCount, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Scatter(edgesCount.data(), 1, MPI_INT,
+                &localEdgesCount,1, MPI_INT, 0, MPI_COMM_WORLD);
+    local_n = localRowsCount - 1;
 
-    if (rank_ != 0) {
-        FILE* null_out = freopen("/dev/null", "w", stdout);
-        FILE* null_err = freopen("/dev/null", "w", stderr);
-        (void)null_out;
-        (void)null_err;
+    edge_id_t*   localRows     = (edge_id_t*)malloc(localRowsCount * sizeof(edge_id_t));
+    vertex_id_t* localEndV     = (vertex_id_t*)malloc(localEdgesCount * sizeof(vertex_id_t));
+    weight_t*    localWeights  = (weight_t*)malloc(localEdgesCount * sizeof(weight_t));
+    edge_id_t*   localEdgeIds  = (edge_id_t*)malloc(localEdgesCount * sizeof(edge_id_t));
+
+    MPI_Scatterv(
+        rank_ == 0 ? G->rowsIndices : nullptr,
+        rowsCount.data(), rowsDisp.data(), MPI_UINT64_T,
+        localRows,         localRowsCount,    MPI_UINT64_T,
+        0, MPI_COMM_WORLD
+    );
+    MPI_Scatterv(
+        rank_ == 0 ? G->endV : nullptr,
+        edgesCount.data(), edgesDisp.data(), MPI_UINT32_T,
+        localEndV,          localEdgesCount,   MPI_UINT32_T,
+        0, MPI_COMM_WORLD
+    );
+    MPI_Scatterv(
+        rank_ == 0 ? G->weights : nullptr,
+        edgesCount.data(), edgesDisp.data(), MPI_DOUBLE,
+        localWeights,       localEdgesCount,   MPI_DOUBLE,
+        0, MPI_COMM_WORLD
+    );
+    MPI_Scatterv(
+        rank_ == 0 ? globalEdgeIds.data() : nullptr,
+        edgesCount.data(), edgesDisp.data(), MPI_UINT64_T,
+        localEdgeIds,       localEdgesCount,   MPI_UINT64_T,
+        0, MPI_COMM_WORLD
+    );
+
+    edge_id_t base = localRows[0];
+    for (int i = 0; i < localRowsCount; ++i)
+        localRows[i] -= base;
+
+    uint32_t start_global = (TotVertices * rank_) / size_;
+    local2global = (vertex_id_t*)malloc(local_n * sizeof(vertex_id_t));
+    for (int i = 0; i < local_n; ++i)
+        local2global[i] = start_global + i;
+
+    if (rank_ == 0) {
+        free(G->rowsIndices);
+        free(G->endV);
+        free(G->weights);
     }
-
-
-    TotVertices = G->n;
-    G->rank = rank_;
-    G->nproc = size_;
-
-    lgsize = 0;
-    while ((1 << lgsize) < size_) {
-        lgsize++;
-    }
+    G->rowsIndices   = localRows;
+    G->endV          = localEndV;
+    G->weights       = localWeights;
+    localEdgeIdArr   = localEdgeIds;
 }
 
-static int find_comp(vector<int> &parent, int i)
-{
-    if (parent[i] == i) return i;
-    parent[i] = find_comp(parent, parent[i]);
-    return parent[i];
+static int find_comp(vector<int> &parent, int i) {
+    return parent[i] == i ? i : (parent[i] = find_comp(parent, parent[i]));
 }
 
-static void union_comp(vector<int> &parent, int x, int y)
-{
+static void union_comp(vector<int> &parent, int x, int y) {
     int rx = find_comp(parent, x);
     int ry = find_comp(parent, y);
-    if (rx != ry) {
-        parent[ry] = rx;
-    }
+    if (rx != ry) parent[ry] = rx;
 }
 
-static vector<Edge> findLocalMinEdges(graph_t *G,
-                                      vector<int> &component,
-                                      int &localEdgesCount)
-{
-  
-    vector<Edge> minEdgeForComp(G->n);
-
-    for (int i = 0; i < (int)G->n; i++) {
+static vector<Edge> findLocalMinEdges(graph_t *G, vector<int> &parent, int &localEdgesCount) {
+    vector<Edge> minEdgeForComp(TotVertices);
+    for (uint32_t i = 0; i < TotVertices; ++i) {
         minEdgeForComp[i].weight  = numeric_limits<weight_t>::max();
         minEdgeForComp[i].startV  = (vertex_id_t)-1;
         minEdgeForComp[i].endV    = (vertex_id_t)-1;
         minEdgeForComp[i].edge_id = (edge_id_t)-1;
     }
-
-   
-    for (vertex_id_t u = 0; u < G->n; ++u) {
-        int comp_u = find_comp(component, u);
-        for (edge_id_t j = G->rowsIndices[u]; j < G->rowsIndices[u + 1]; ++j) {
-            vertex_id_t v = G->endV[j];
-            weight_t w = G->weights[j];
-            int comp_v = find_comp(component, v);
-
-            if (comp_u != comp_v) {
-    
-                if (w < minEdgeForComp[comp_u].weight) {
-                    minEdgeForComp[comp_u].weight  = w;
-                    minEdgeForComp[comp_u].startV  = u;
-                    minEdgeForComp[comp_u].endV    = v;
-                    minEdgeForComp[comp_u].edge_id = j;
-                }
+    for (int u = 0; u < local_n; ++u) {
+        vertex_id_t gu = local2global[u];
+        int comp_u     = find_comp(parent, gu);
+        for (edge_id_t idx = G->rowsIndices[u]; idx < G->rowsIndices[u + 1]; ++idx) {
+            vertex_id_t v = G->endV[idx];
+            weight_t    w = G->weights[idx];
+            int comp_v   = find_comp(parent, v);
+            if (comp_u != comp_v && w < minEdgeForComp[comp_u].weight) {
+                minEdgeForComp[comp_u].weight  = w;
+                minEdgeForComp[comp_u].startV  = gu;
+                minEdgeForComp[comp_u].endV    = v;
+                minEdgeForComp[comp_u].edge_id = localEdgeIdArr[idx];
             }
         }
     }
-
     vector<Edge> localEdges;
-    localEdges.reserve(G->n);
-    for (int i = 0; i < (int)G->n; i++) {
-        if (minEdgeForComp[i].startV != (vertex_id_t)-1) {
-            localEdges.push_back(minEdgeForComp[i]);
-        }
+    localEdges.reserve(local_n);
+    for (uint32_t c = 0; c < TotVertices; ++c) {
+        if (minEdgeForComp[c].startV != (vertex_id_t)-1)
+            localEdges.push_back(minEdgeForComp[c]);
     }
     localEdgesCount = (int)localEdges.size();
     return localEdges;
 }
 
-extern "C" void* MST(graph_t *G)
-{
+extern "C" void init_mst(graph_t *G) {
+    int flag = 0;
+    MPI_Initialized(&flag);
+    if (!flag) MPI_Init(NULL, NULL);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
+    MPI_Comm_size(MPI_COMM_WORLD, &size_);
+    create_mpi_edge_type();
 
-    vector<int> parent(G->n);
-    for (vertex_id_t i = 0; i < G->n; i++) {
-        parent[i] = i;
+    if (rank_ == 0) {
+        TotVertices = G->n;
+    }
+    MPI_Bcast(&TotVertices, 1, MPI_UINT32_T, 0, MPI_COMM_WORLD);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    printf("Rank %d sees TotVertices = %u\n", rank_, TotVertices);
+    fflush(stdout);
+
+    partition_graph(G);
+
+    if (rank_ != 0) {
+        freopen("/dev/null", "w", stdout);
+        freopen("/dev/null", "w", stderr);
     }
 
+    G->rank  = rank_;
+    G->nproc = size_;
+    lgsize = 0;
+    while ((1 << lgsize) < size_) ++lgsize;
+}
+
+
+extern "C" void* MST(graph_t *G) {
+    vector<int> parent(TotVertices);
+    for (uint32_t i = 0; i < TotVertices; ++i)
+        parent[i] = i;
     vector<Edge> mstEdges;
-    mstEdges.reserve(G->n - 1); 
+    mstEdges.reserve(TotVertices - 1);
 
     bool somethingMerged = true;
-
-    while (somethingMerged)
-    {
+    while (somethingMerged) {
         int localEdgesCount = 0;
         vector<Edge> localEdges = findLocalMinEdges(G, parent, localEdgesCount);
 
         vector<int> recvCounts(size_);
-
         MPI_Gather(&localEdgesCount, 1, MPI_INT,
-                   &recvCounts[0], 1, MPI_INT,
+                   recvCounts.data(),    1, MPI_INT,
                    0, MPI_COMM_WORLD);
 
         vector<Edge> globalEdges;
         int totalCount = 0;
-
         if (rank_ == 0) {
-            for (int i = 0; i < size_; i++) {
-                totalCount += recvCounts[i];
-            }
+            for (int c : recvCounts)
+                totalCount += c;
             globalEdges.resize(totalCount);
 
-            for (int i = 0; i < localEdgesCount; i++) {
+            for (int i = 0; i < localEdgesCount; ++i)
                 globalEdges[i] = localEdges[i];
-            }
             int offset = localEdgesCount;
-
-            for (int proc = 1; proc < size_; proc++) {
-                int count = recvCounts[proc];
-                if (count > 0) {
-             
-                    MPI_Recv(&globalEdges[offset], count, MPI_Edge, proc, 777, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
+            for (int p = 1; p < size_; ++p) {
+                int cnt = recvCounts[p];
+                if (cnt > 0) {
+                    MPI_Recv(&globalEdges[offset], cnt, MPI_Edge,
+                             p, 777, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 }
-                offset += count;
+                offset += cnt;
             }
-        }
-        else {
+        } else {
             if (localEdgesCount > 0) {
-             
-                MPI_Send(localEdges.data(), localEdgesCount, MPI_Edge, 0, 777, MPI_COMM_WORLD);
-
+                MPI_Send(localEdges.data(), localEdgesCount,
+                         MPI_Edge, 0, 777, MPI_COMM_WORLD);
             }
         }
 
-        bool localSomethingMerged = false;
+        bool merged = false;
         if (rank_ == 0) {
-    
-            for (int i = 0; i < totalCount; i++) {
-                Edge &e = globalEdges[i];
-                int compU = find_comp(parent, e.startV);
-                int compV = find_comp(parent, e.endV);
-                if (compU != compV) {
-                 
-                    mstEdges.push_back(e);
-                    union_comp(parent, compU, compV);
-                    localSomethingMerged = true;
+            vector<Edge> best(TotVertices);
+            for (uint32_t c = 0; c < TotVertices; ++c) {
+                best[c].weight  = numeric_limits<weight_t>::max();
+                best[c].startV  = (vertex_id_t)-1;
+                best[c].endV    = (vertex_id_t)-1;
+                best[c].edge_id = (edge_id_t)-1;
+            }
+
+            for (const Edge &e : globalEdges) {
+                int comp = find_comp(parent, e.startV);
+                if (e.weight < best[comp].weight) {
+                    best[comp] = e;
+                }
+            }
+
+            for (uint32_t c = 0; c < TotVertices; ++c) {
+                if (best[c].startV != (vertex_id_t)-1) {
+                    int cu = find_comp(parent, best[c].startV);
+                    int cv = find_comp(parent, best[c].endV);
+                    if (cu != cv) {
+                        union_comp(parent, cu, cv);
+                        mstEdges.push_back(best[c]);
+                        merged = true;
+                    }
                 }
             }
         }
 
-        MPI_Bcast(&localSomethingMerged, 1, MPI_C_BOOL, 0, MPI_COMM_WORLD);
+        MPI_Bcast(&merged, 1, MPI_C_BOOL, 0, MPI_COMM_WORLD);
+        MPI_Bcast(parent.data(), TotVertices, MPI_INT, 0, MPI_COMM_WORLD);
 
-        MPI_Bcast(parent.data(), parent.size(), MPI_INT, 0, MPI_COMM_WORLD);
-
-        somethingMerged = localSomethingMerged;
+        somethingMerged = merged;
     }
 
-    auto *mstResult = new vector<Edge>(std::move(mstEdges));
-    return mstResult;
+    return new vector<Edge>(std::move(mstEdges));
 }
 
-extern "C" void convert_to_output(graph_t *G, void* result, forest_t *trees_output)
-{
-    vector<Edge> &mstEdges = *reinterpret_cast<vector<Edge>*>(result);
 
-    trees_output->numTrees = 1;
-    trees_output->numEdges = mstEdges.size();
-
-    trees_output->edge_id = (edge_id_t*)malloc(mstEdges.size() * sizeof(edge_id_t));
-    trees_output->p_edge_list = (edge_id_t *)malloc(2 * sizeof(edge_id_t));
-
-    trees_output->p_edge_list[0] = 0;                
-    trees_output->p_edge_list[1] = mstEdges.size();   
-
-    for (size_t i = 0; i < mstEdges.size(); i++) {
-        trees_output->edge_id[i] = mstEdges[i].edge_id;
+extern "C" void convert_to_output(graph_t *G, void* result, forest_t *out) {
+    if (G->rank != 0) {
+        delete reinterpret_cast<vector<Edge>*>(result);
+        return;
     }
-
+    
+    vector<Edge> &mst = *reinterpret_cast<vector<Edge>*>(result);
+    out->numTrees    = 1;
+    out->numEdges    = mst.size();
+    out->edge_id     = (edge_id_t*)malloc(mst.size() * sizeof(edge_id_t));
+    out->p_edge_list = (edge_id_t*)malloc(2 * sizeof(edge_id_t));
+    out->p_edge_list[0] = 0;
+    out->p_edge_list[1] = (edge_id_t)mst.size();
+    for (size_t i = 0; i < mst.size(); ++i)
+        out->edge_id[i] = mst[i].edge_id;
     delete reinterpret_cast<vector<Edge>*>(result);
 }
 
-extern "C" void finalize_mst(graph_t *G)
-{
+extern "C" void finalize_mst(graph_t *G) {
     int flag = 0;
     MPI_Finalized(&flag);
-    if(!flag) {
+    if (!flag) {
         MPI_Type_free(&MPI_Edge);
         MPI_Finalize();
     }
